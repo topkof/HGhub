@@ -1,0 +1,220 @@
+name: Android APK (arm64-v8a + armeabi-v7a)
+
+# 只编 arm64-v8a 与 armeabi-v7a 两个 ABI 的 APK（不编 x86 模拟器包）。
+#
+# 触发
+#   * 手动：Actions → Android APK (arm64-v8a + armeabi-v7a) → Run workflow
+#   * push 到 main/master 且改动涉及前端、src-tauri、依赖或本文件
+#
+# 签名
+#   没有 secrets 时自动生成一次性 debug 密钥 → 可直接 adb install 自测；
+#   配了 ANDROID_KEY_BASE64 / ANDROID_KEY_ALIAS /
+#   ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_PASSWORD 就用正式密钥，
+#   可覆盖升级。
+#
+# 产物：HGhub_<版本>_arm64-v8a.apk 与 HGhub_<版本>_armeabi-v7a.apk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "src-tauri/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "scripts/**"
+      - ".github/workflows/android.yml"
+
+concurrency:
+  group: android-arm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Build arm64-v8a + armeabi-v7a APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CI: "true"
+      NDK_VERSION: 28.2.13676358
+      ANDROID_PLATFORM: "android-36"
+      BUILD_TOOLS: "36.0.0"
+      ABIS: "arm64-v8a armeabi-v7a"
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          V=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      # pnpm 必须先于 setup-node：后者的 pnpm 缓存要调用 pnpm 本身
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 安装 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            echo "::error::找不到 sdkmanager（$SDKM），runner 镜像变了"
+            ls -la "$SDK" || true
+            exit 1
+          fi
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" \
+            "platforms;$ANDROID_PLATFORM" \
+            "build-tools;$BUILD_TOOLS" \
+            "ndk;$NDK_VERSION"
+          ls "$SDK/ndk"
+
+      - name: 准备 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装 arm64 / armv7 Rust 目标
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64-armv7
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-v1
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          echo "java  : $(java -version 2>&1 | head -1)"
+          echo "node  : $(node -v)"
+          echo "pnpm  : $(pnpm -v)"
+          echo "rustc : $(rustc -V)"
+          echo "target: $(rustup target list --installed | tr '\n' ' ')"
+          echo "ndk   : $NDK_HOME"
+          ls "$NDK_HOME" > /dev/null
+
+      - name: 编译 APK（arm64 + armv7）
+        run: |
+          set -euo pipefail
+          pnpm tauri android build --apk \
+            --split-per-abi --target aarch64 armv7
+
+      - name: 收集并重命名 APK
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT=src-tauri/gen/android/app/build/outputs/apk
+          mkdir -p artifacts
+          for abi in $ABIS; do
+            f=$(find "$OUT" -path "*/$abi/*" -name "*-release*.apk" | head -1)
+            if [ -z "$f" ]; then
+              f=$(find "$OUT" -path "*/$abi/*" -name "*.apk" | head -1)
+            fi
+            if [ -z "$f" ]; then
+              echo "::error::缺少 $abi 的 APK"
+              find "$OUT" -type f -name "*.apk" || true
+              exit 1
+            fi
+            cp "$f" "artifacts/HGhub_${V}_${abi}.apk"
+          done
+          ls -lh artifacts
+
+      - name: 准备签名密钥
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/sign.keystore"
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            ALIAS="$KEY_ALIAS"
+            SP="$STORE_PASSWORD"
+            KP="$KEY_PASSWORD"
+            echo "使用 secrets 中的正式签名密钥"
+          else
+            keytool -genkeypair -keystore "$KS" \
+              -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              > /dev/null 2>&1
+            ALIAS=androiddebugkey
+            SP=android
+            KP=android
+            echo "::warning::未配置 ANDROID_KEY_BASE64"
+            echo "::warning::本次用一次性 debug 密钥签名"
+            echo "::warning::可安装自测，不能覆盖升级正式版或上架"
+          fi
+          {
+            echo "KS_PATH=$KS"
+            echo "KS_ALIAS=$ALIAS"
+            echo "KS_STORE_PASS=$SP"
+            echo "KS_KEY_PASS=$KP"
+          } >> "$GITHUB_ENV"
+
+      - name: 签名 + 校验
+        run: |
+          set -euo pipefail
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          AS="$ANDROID_HOME/build-tools/$BT/apksigner"
+          for f in artifacts/*.apk; do
+            "$AS" sign \
+              --ks "$KS_PATH" --ks-key-alias "$KS_ALIAS" \
+              --ks-pass "pass:$KS_STORE_PASS" \
+              --key-pass "pass:$KS_KEY_PASS" \
+              --v4-signing-enabled false \
+              --out "$f.tmp" "$f"
+            mv "$f.tmp" "$f"
+            echo "== $(basename "$f") ($(du -h "$f" | cut -f1))"
+            "$AS" verify --print-certs "$f" | head -4
+          done
+          rm -f "$KS_PATH"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-android-arm64-armv7
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 14
